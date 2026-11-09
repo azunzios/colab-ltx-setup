@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Automated ComfyUI Installer & Cloudflare Tunnel Launcher for Google Colab Terminal.
+Automated ComfyUI Installer & Tunnel Launcher for Google Colab Terminal.
 Repository: https://github.com/azunzios/colab-ltx-setup
 """
 
@@ -161,6 +161,21 @@ def wait_for_port(host: str, port: int, stop_event: threading.Event, timeout: in
     return False
 
 
+def print_tunnel_banner(provider: str, public_url: str, host: str, port: int, extra_line: str = "") -> None:
+    extra_block = f"  {extra_line}\n" if extra_line else ""
+    banner = (
+        f"\n{Colors.GREEN}{Colors.BOLD}"
+        + "=" * 70
+        + f"\n  COMFYUI SIAP DIAKSES MELALUI INTERNET ({provider.upper()} TUNNEL)\n"
+        + f"  URL Publik : {Colors.UNDERLINE}{public_url}{Colors.END}{Colors.GREEN}{Colors.BOLD}\n"
+        + extra_block
+        + f"  URL Lokal  : http://{host}:{port}\n"
+        + "=" * 70
+        + f"{Colors.END}\n"
+    )
+    print(banner, flush=True)
+
+
 def start_cloudflare_tunnel(
     cloudflared_bin: Path,
     host: str,
@@ -181,6 +196,8 @@ def start_cloudflare_tunnel(
             "tunnel",
             "--url",
             f"http://{host}:{port}",
+            "--http-host-header",
+            f"{host}:{port}",
             "--no-autoupdate",
         ],
         stdout=subprocess.PIPE,
@@ -200,16 +217,104 @@ def start_cloudflare_tunnel(
             if match and not url_found:
                 url_found = True
                 public_url = match.group(0)
-                banner = (
-                    f"\n{Colors.GREEN}{Colors.BOLD}"
-                    + "=" * 68
-                    + f"\n  COMFYUI SIAP DIAKSES MELALUI INTERNET (CLOUDFLARE TUNNEL)\n"
-                    + f"  URL Publik : {Colors.UNDERLINE}{public_url}{Colors.END}{Colors.GREEN}{Colors.BOLD}\n"
-                    + f"  URL Lokal  : http://{host}:{port}\n"
-                    + "=" * 68
-                    + f"{Colors.END}\n"
-                )
-                print(banner, flush=True)
+                print_tunnel_banner("Cloudflare", public_url, host, port)
+
+    reader_thread = threading.Thread(target=monitor_tunnel_output, daemon=True)
+    reader_thread.start()
+    return tunnel_proc
+
+
+def start_pinggy_tunnel(
+    host: str,
+    port: int,
+    stop_event: threading.Event,
+) -> subprocess.Popen | None:
+    """Wait for local ComfyUI server to listen, then start Pinggy SSH tunnel."""
+    log_info(f"Menunggu server ComfyUI aktif di {host}:{port} sebelum membuka Pinggy Tunnel...")
+    if not wait_for_port(host, port, stop_event):
+        if not stop_event.is_set():
+            log_error(f"Waktu habis menunggu ComfyUI di {host}:{port}.")
+        return None
+
+    log_info("ComfyUI sudah aktif! Membuka koneksi Pinggy Tunnel via SSH...")
+    tunnel_proc = subprocess.Popen(
+        [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ServerAliveInterval=30",
+            "-p",
+            "443",
+            f"-R0:{host}:{port}",
+            "a.pinggy.io",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    url_pattern = re.compile(r"https://[a-zA-Z0-9.-]+\.pinggy\.link")
+    url_found = False
+
+    def monitor_tunnel_output() -> None:
+        nonlocal url_found
+        assert tunnel_proc.stdout is not None
+        for line in tunnel_proc.stdout:
+            match = url_pattern.search(line)
+            if match and not url_found:
+                url_found = True
+                public_url = match.group(0)
+                print_tunnel_banner("Pinggy", public_url, host, port)
+
+    reader_thread = threading.Thread(target=monitor_tunnel_output, daemon=True)
+    reader_thread.start()
+    return tunnel_proc
+
+
+def start_localtunnel(
+    host: str,
+    port: int,
+    stop_event: threading.Event,
+) -> subprocess.Popen | None:
+    """Wait for local ComfyUI server to listen, then start Localtunnel via npx."""
+    log_info(f"Menunggu server ComfyUI aktif di {host}:{port} sebelum membuka Localtunnel...")
+    if not wait_for_port(host, port, stop_event):
+        if not stop_event.is_set():
+            log_error(f"Waktu habis menunggu ComfyUI di {host}:{port}.")
+        return None
+
+    public_ip = ""
+    try:
+        with urllib.request.urlopen("https://ipv4.icanhazip.com", timeout=5) as resp:
+            public_ip = resp.read().decode("utf-8").strip()
+    except Exception:
+        pass
+
+    log_info("ComfyUI sudah aktif! Membuka koneksi Localtunnel...")
+    tunnel_proc = subprocess.Popen(
+        ["npx", "--yes", "localtunnel", "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    url_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.loca\.lt")
+    url_found = False
+
+    def monitor_tunnel_output() -> None:
+        nonlocal url_found
+        assert tunnel_proc.stdout is not None
+        for line in tunnel_proc.stdout:
+            match = url_pattern.search(line)
+            if match and not url_found:
+                url_found = True
+                public_url = match.group(0)
+                extra = f"Password Tunnel (IP Colab) : {public_ip}" if public_ip else ""
+                print_tunnel_banner("Localtunnel", public_url, host, port, extra_line=extra)
 
     reader_thread = threading.Thread(target=monitor_tunnel_output, daemon=True)
     reader_thread.start()
@@ -219,7 +324,7 @@ def start_cloudflare_tunnel(
 def parse_args() -> argparse.Namespace:
     default_base = get_default_base_dir()
     parser = argparse.ArgumentParser(
-        description="Instalasi otomatis ComfyUI + Cloudflare Tunnel untuk Google Colab Terminal."
+        description="Instalasi otomatis ComfyUI + Tunneling untuk Google Colab Terminal."
     )
     parser.add_argument(
         "--dir",
@@ -238,6 +343,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8188,
         help="Port untuk menjalankan ComfyUI (default: 8188)",
+    )
+    parser.add_argument(
+        "--tunnel",
+        type=str,
+        choices=["cloudflare", "pinggy", "localtunnel"],
+        default="cloudflare",
+        help="Penyedia tunnel internet: cloudflare (default), pinggy, atau localtunnel",
     )
     parser.add_argument(
         "--no-manager",
@@ -271,14 +383,17 @@ def main() -> None:
     print(
         f"{Colors.HEADER}{Colors.BOLD}"
         "============================================================\n"
-        "       ComfyUI + Cloudflare Tunnel Automation Script        \n"
+        "       ComfyUI + Tunnel Automation Script (Colab)           \n"
         "============================================================"
         f"{Colors.END}",
         flush=True,
     )
 
     try:
-        cloudflared_bin = install_cloudflared(bin_dir)
+        cloudflared_bin: Path | None = None
+        if args.tunnel == "cloudflare":
+            cloudflared_bin = install_cloudflared(bin_dir)
+
         install_comfyui(
             comfy_dir=comfy_dir,
             install_manager=not args.no_manager,
@@ -293,16 +408,32 @@ def main() -> None:
         tunnel_holder: dict[str, subprocess.Popen | None] = {"proc": None}
 
         def tunnel_worker() -> None:
-            tunnel_holder["proc"] = start_cloudflare_tunnel(
-                cloudflared_bin=cloudflared_bin,
-                host=args.host,
-                port=args.port,
-                stop_event=stop_event,
-            )
+            if args.tunnel == "cloudflare":
+                assert cloudflared_bin is not None
+                tunnel_holder["proc"] = start_cloudflare_tunnel(
+                    cloudflared_bin=cloudflared_bin,
+                    host=args.host,
+                    port=args.port,
+                    stop_event=stop_event,
+                )
+            elif args.tunnel == "pinggy":
+                tunnel_holder["proc"] = start_pinggy_tunnel(
+                    host=args.host,
+                    port=args.port,
+                    stop_event=stop_event,
+                )
+            elif args.tunnel == "localtunnel":
+                tunnel_holder["proc"] = start_localtunnel(
+                    host=args.host,
+                    port=args.port,
+                    stop_event=stop_event,
+                )
 
         tunnel_thread = threading.Thread(target=tunnel_worker, daemon=True)
         tunnel_thread.start()
 
+        # Penting: --enable-cors-header * mencegah error HTTP 403 Forbidden
+        # dari origin_only_middleware bawaan ComfyUI saat diakses via Cloudflare/Reverse Proxy.
         comfy_cmd = [
             sys.executable,
             "main.py",
@@ -310,6 +441,8 @@ def main() -> None:
             args.host,
             "--port",
             str(args.port),
+            "--enable-cors-header",
+            "*",
         ]
         if args.extra_args.strip():
             comfy_cmd.extend(args.extra_args.strip().split())
@@ -320,7 +453,7 @@ def main() -> None:
         try:
             comfy_proc.wait()
         except KeyboardInterrupt:
-            log_warn("\nInterupsi diterima (Ctrl+C). Menghentikan ComfyUI & Cloudflare Tunnel...")
+            log_warn("\nInterupsi diterima (Ctrl+C). Menghentikan ComfyUI & Tunnel...")
         finally:
             stop_event.set()
             if comfy_proc.poll() is None:
