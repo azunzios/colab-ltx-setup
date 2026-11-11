@@ -2,6 +2,7 @@
 """ComfyUI + provisioning dashboard for Colab/Linux; standalone, no web framework."""
 
 import argparse
+import getpass
 import hashlib
 import hmac
 import json
@@ -17,6 +18,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
@@ -38,6 +40,7 @@ TUNNEL_PATTERNS = {
     "cloudflare": r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
     "pinggy": r"https://[a-zA-Z0-9.-]+\.pinggy\.link",
     "localtunnel": r"https://[a-zA-Z0-9-]+\.loca\.lt",
+    "ngrok": r"https://[a-zA-Z0-9.-]+\.ngrok(?:-free)?\.(?:app|dev|io)",
 }
 
 
@@ -71,6 +74,60 @@ def install_cloudflared(bin_dir):
         temporary.replace(target)
     target.chmod(0o755)
     return target
+
+
+def install_ngrok(bin_dir):
+    existing = shutil.which("ngrok")
+    if existing:
+        return Path(existing)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    target = bin_dir / "ngrok"
+    if not target.is_file():
+        arch = platform.machine().lower()
+        if arch not in ("aarch64", "arm64", "x86_64", "amd64"):
+            raise RuntimeError(f"Arsitektur ngrok tidak didukung: {arch}")
+        suffix = "arm64" if arch in ("aarch64", "arm64") else "amd64"
+        url = f"https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-{suffix}.tgz"
+        archive = bin_dir / "ngrok.tgz.part"
+        temporary = bin_dir / "ngrok.part"
+        try:
+            urllib.request.urlretrieve(url, archive)
+            # Copy only the executable; never extract paths supplied by the archive.
+            with tarfile.open(archive, "r:gz") as bundle:
+                member = bundle.getmember("ngrok")
+                if not member.isfile():
+                    raise RuntimeError("Arsip ngrok tidak berisi executable yang valid.")
+                with bundle.extractfile(member) as source, temporary.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            temporary.chmod(0o755)
+            temporary.replace(target)
+        finally:
+            archive.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
+    target.chmod(0o755)
+    return target
+
+
+def prepare_ngrok_config(runtime):
+    """Keep the credential out of command lines, status output, and service state."""
+    config = runtime / "ngrok.yml"
+    token = os.environ.get("NGROK_AUTHTOKEN", "").strip()
+    if not token and config.is_file():
+        token = str(load_json(config).get("authtoken", "")).strip()
+    if not token:
+        log_info("Authtoken ngrok: https://dashboard.ngrok.com/get-started/your-authtoken")
+        if not sys.stdin.isatty():
+            raise RuntimeError("Masukkan authtoken lewat Terminal dengan --tunnel ngrok, "
+                               "atau isi environment NGROK_AUTHTOKEN sebelum menjalankan setup.")
+        try:
+            token = getpass.getpass("Tempel authtoken ngrok (input disembunyikan): ").strip()
+        except EOFError as exc:
+            raise RuntimeError("Authtoken ngrok belum diisi. Gunakan NGROK_AUTHTOKEN atau Terminal interaktif.") from exc
+    if not token or any(character.isspace() for character in token):
+        raise ValueError("Authtoken ngrok kosong/tidak valid. Tempel authtoken saja, tanpa perintah ngrok.")
+    # JSON is valid YAML; no YAML package needed in the standalone setup script.
+    save_json(config, {"version": "2", "authtoken": token, "web_addr": "false", "update_check": False})
+    return config
 
 
 def install_comfyui(comfy_dir, install_manager=True, update=False):
@@ -242,7 +299,7 @@ def tail_log(path, limit=24000):
         return ""
 
 
-def tunnel_command(provider, host, port, cloudflared):
+def tunnel_command(provider, host, port, cloudflared, ngrok=None, ngrok_config=None):
     address = connect_host(host)
     if provider == "cloudflare":
         return [str(cloudflared), "tunnel", "--url", f"http://{address}:{port}",
@@ -250,7 +307,30 @@ def tunnel_command(provider, host, port, cloudflared):
     if provider == "pinggy":
         return ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "ExitOnForwardFailure=yes",
                 "-o", "ServerAliveInterval=30", "-p", "443", f"-R0:{address}:{port}", "a.pinggy.io"]
+    if provider == "ngrok":
+        if not ngrok or not ngrok_config:
+            raise ValueError("Executable dan konfigurasi ngrok belum disiapkan.")
+        return [str(ngrok), "http", f"http://{address}:{port}", "--config", str(ngrok_config),
+                "--inspect=false", "--log=stdout", "--log-format=json"]
     return ["npx", "--yes", "localtunnel", "--port", str(port), "--local-host", address]
+
+
+def tunnel_url(provider, output):
+    if provider == "ngrok":
+        # Match the started endpoint, not help/error URLs or an upstream address.
+        for line in reversed(output.splitlines()):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("msg") == "started tunnel":
+                url = record.get("url", "")
+                parsed = urllib.parse.urlsplit(url)
+                if parsed.scheme == "https" and parsed.hostname:
+                    return url
+        return None
+    matches = re.findall(TUNNEL_PATTERNS[provider], output)
+    return matches[-1] if matches else None
 
 
 def wait_for_tunnel(proc, log_path, provider, timeout=75):
@@ -258,9 +338,9 @@ def wait_for_tunnel(proc, log_path, provider, timeout=75):
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"Tunnel {provider} keluar. Lihat {log_path}")
-        matches = re.findall(TUNNEL_PATTERNS[provider], tail_log(log_path))
-        if matches:
-            return matches[-1]
+        url = tunnel_url(provider, tail_log(log_path))
+        if url:
+            return url
         time.sleep(0.5)
     raise RuntimeError(f"URL tunnel {provider} belum tersedia. Lihat {log_path}")
 
@@ -276,6 +356,8 @@ def show_status(runtime, reveal_password=False):
     print(f"ComfyUI    : {state.get('comfy_url', '(belum ada tunnel)')}")
     print(f"Dashboard  : {state.get('dashboard_url', '(belum ada tunnel)')}")
     print(f"Lokal      : ComfyUI :{state.get('port')} | dashboard :{state.get('dashboard_port')}")
+    if state.get("tunnel"):
+        print(f"Tunnel     : {state['tunnel']} | dashboard: cloudflare")
     if reveal_password:
         print(f"Password dashboard: {state.get('password', '')}")
     print(f"State      : {runtime / 'state.json'}")
@@ -927,7 +1009,22 @@ def run_dashboard(args):
     server.serve_forever()
 
 
-def launch_stack(args, comfy_dir, runtime, hf_command, cloudflared):
+def comfy_command(args, comfy_dir):
+    command = [sys.executable, "-u", "main.py", "--listen", args.host, "--port", str(args.port),
+               "--enable-cors-header", "*"]
+    extra = shlex.split(args.extra_args)
+    if args.web_optimizations:
+        # Inspect the installed parser without importing torch or custom nodes.
+        parser_file = comfy_dir / "comfy" / "cli_args.py"
+        supported = parser_file.read_text(encoding="utf-8") if parser_file.is_file() else ""
+        for flag, values in (("--enable-compress-response-body", []), ("--preview-size", ["256"])):
+            if flag in supported and not any(arg.split("=", 1)[0] == flag for arg in extra):
+                command.extend([flag, *values])
+    command.extend(extra)
+    return command
+
+
+def launch_stack(args, comfy_dir, runtime, hf_command, cloudflared, ngrok=None, ngrok_config=None):
     state_path = runtime / "state.json"
     old = load_json(state_path)
     if any(is_running(entry) for entry in old.get("services", {}).values()):
@@ -938,7 +1035,7 @@ def launch_stack(args, comfy_dir, runtime, hf_command, cloudflared):
             raise RuntimeError(f"Port {host}:{port} sudah dipakai proses lain.")
     state = {"host": args.host, "port": args.port, "dashboard_port": args.dashboard_port,
              "comfy_dir": str(comfy_dir), "python_command": sys.executable, "hf_command": hf_command,
-             "password": old.get("password") or secrets.token_urlsafe(24), "services": {}}
+             "password": old.get("password") or secrets.token_urlsafe(24), "tunnel": args.tunnel, "services": {}}
     save_json(state_path, state)
 
     def start(name, command, cwd):
@@ -949,9 +1046,7 @@ def launch_stack(args, comfy_dir, runtime, hf_command, cloudflared):
         return proc, logfile
 
     try:
-        comfy_cmd = [sys.executable, "-u", "main.py", "--listen", args.host, "--port", str(args.port),
-                     "--enable-cors-header", "*"]
-        comfy_cmd.extend(shlex.split(args.extra_args))
+        comfy_cmd = comfy_command(args, comfy_dir)
         comfy_proc, comfy_log = start("comfy", comfy_cmd, comfy_dir)
         dashboard_proc, dashboard_log = start("dashboard", [sys.executable, "-u", str(Path(__file__).resolve()),
              "--dir", str(comfy_dir), "--dashboard-port", str(args.dashboard_port), "--serve-dashboard"], comfy_dir)
@@ -963,12 +1058,15 @@ def launch_stack(args, comfy_dir, runtime, hf_command, cloudflared):
         save_json(state_path, state)
         print(f"\nDashboard: {state['dashboard_url']}\nPassword : {state['password']}\n", flush=True)
         wait_for_service(comfy_proc, args.host, args.port, comfy_log)
-        comfy_tunnel, comfy_tunnel_log = start("comfy_tunnel", tunnel_command(args.tunnel, args.host, args.port, cloudflared), comfy_dir)
+        comfy_tunnel, comfy_tunnel_log = start("comfy_tunnel", tunnel_command(
+            args.tunnel, args.host, args.port, cloudflared, ngrok, ngrok_config), comfy_dir)
         state["comfy_url"] = wait_for_tunnel(comfy_tunnel, comfy_tunnel_log, args.tunnel)
         save_json(state_path, state)
         show_status(runtime, reveal_password=True)
         if args.tunnel == "localtunnel":
             log_info("Jika Localtunnel meminta password, gunakan IP publik runtime Colab.")
+        if args.tunnel == "ngrok":
+            log_info("ngrok aktif tanpa inspeksi HTTP. Jika muncul halaman Visit Site, lanjutkan sekali di browser.")
         log_info("ComfyUI, dashboard, dan kedua tunnel berjalan dengan nohup. Terminal boleh ditutup.")
     except BaseException:
         stop_stack(runtime, state)
@@ -983,7 +1081,9 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8188)
     parser.add_argument("--dashboard-port", type=int, default=8189)
     parser.add_argument("--tunnel", choices=list(TUNNEL_PATTERNS), default="cloudflare",
-                        help="Tunnel ComfyUI; dashboard selalu memakai Cloudflare")
+                        help="Tunnel ComfyUI; ngrok meminta authtoken (atau NGROK_AUTHTOKEN). Dashboard selalu Cloudflare")
+    parser.add_argument("--web-optimizations", action=argparse.BooleanOptionalAction, default=True,
+                        help="Kompresi respons API dan preview 256px jika didukung ComfyUI (default: aktif)")
     parser.add_argument("--no-manager", action="store_true")
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--install-only", action="store_true")
@@ -1044,13 +1144,15 @@ def manage_stack(args, comfy_dir, runtime):
     runtime.chmod(0o700)
     hf_command = install_tools(runtime)
     cloudflared = install_cloudflared(comfy_dir.parent / ".bin")
+    ngrok = install_ngrok(comfy_dir.parent / ".bin") if args.tunnel == "ngrok" else None
     if args.install_only:
         log_info("Instalasi selesai. Jalankan kembali dengan --skip-install untuk memulai layanan.")
         return
     required = {"pinggy": "ssh", "localtunnel": "npx"}.get(args.tunnel)
     if required and not shutil.which(required):
         raise RuntimeError(f"Tunnel {args.tunnel} membutuhkan {required} di PATH.")
-    launch_stack(args, comfy_dir, runtime, hf_command, cloudflared)
+    ngrok_config = prepare_ngrok_config(runtime) if args.tunnel == "ngrok" else None
+    launch_stack(args, comfy_dir, runtime, hf_command, cloudflared, ngrok, ngrok_config)
 
 
 if __name__ == "__main__":
