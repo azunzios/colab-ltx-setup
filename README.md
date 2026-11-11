@@ -24,13 +24,15 @@ curl -fLsS https://raw.githubusercontent.com/azunzios/colab-ltx-setup/main/setup
 python3 setup_comfyui.py --dir /content/ComfyUI
 ```
 
-`--dir` adalah **root ComfyUI yang berisi `main.py`, `models/`, dan `custom_nodes/`**, bukan `/content`. Default pada Colab adalah `/content/ComfyUI`. Perlu Linux, Python 3.10+, `git`, `wget`, `nohup`, serta dukungan `venv`/`pip`. Script mengunduh `cloudflared` otomatis. `hf` dipasang di environment tools terpisah agar versi library-nya tidak mengubah dependensi ComfyUI.
+`--dir` adalah **root ComfyUI yang berisi `main.py`, `models/`, dan `custom_nodes/`**, bukan `/content`. Default pada Colab adalah `/content/ComfyUI`. Perlu Linux, Python 3.10+, `git`, `wget`, `nohup`, serta modul `venv`. Script mengunduh `cloudflared` otomatis. `hf` dipasang di environment tools terpisah agar versi library-nya tidak mengubah dependensi ComfyUI. Environment ini dibuat dengan `venv --without-pip`, sehingga tidak bergantung pada `ensurepip` Colab. Paket HF dipasang menggunakan `uv` jika tersedia, atau pip milik Python setup dengan `--python` (pip 22.3+). Dukungan environment tanpa pip ini didokumentasikan di [pip --python](https://pip.pypa.io/en/stable/topics/python-option/).
 
 Jika ComfyUI sudah terpasang:
 
 ```bash
 python3 setup_comfyui.py --dir /content/ComfyUI --skip-install
 ```
+
+Jika sebelumnya setup gagal pada `ensurepip` saat membuat `.provisioning/hf-tools`, cukup perbarui script lalu jalankan ulang perintah di atas. Script memperbaiki environment yang terbuat sebagian secara otomatis, tanpa menghapus model atau menginstal ulang dependensi ComfyUI. File `hf` yang rusak/tidak mendukung login device code juga diperbaiki; environment yang sehat dipakai kembali.
 
 Buka URL **Dashboard**, lalu masukkan password dashboard yang dicetak terminal. Password ini untuk dashboard, terpisah dari login Hugging Face. Semua API provisioning memerlukan password; path file dibatasi ke workspace ComfyUI. Simpan password karena dashboard bisa menginstal kode/paket. ComfyUI sendiri tetap mengikuti mekanisme akses ComfyUI yang ada.
 

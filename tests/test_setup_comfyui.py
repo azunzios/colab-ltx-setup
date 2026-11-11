@@ -35,6 +35,63 @@ class WorkspaceTest(unittest.TestCase):
             time.sleep(0.02)
 
 
+class ToolsBootstrapTests(WorkspaceTest):
+    def test_partial_environment_recovers_without_ensurepip_using_uv(self):
+        tools = self.runtime / "hf-tools"
+        (tools / "bin").mkdir(parents=True)
+        (tools / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        marker = tools / "keep-existing-data"
+        marker.write_text("keep", encoding="utf-8")
+        def which(command):
+            return "/usr/local/bin/uv" if command == "uv" else "/usr/bin/" + command
+        with mock.patch.object(app.shutil, "which", side_effect=which), \
+             mock.patch.object(app, "hf_cli_ready", side_effect=[False, True]), \
+             mock.patch.object(app, "run_cmd") as run:
+            hf = app.install_tools(self.runtime)
+        self.assertEqual(hf, str(tools / "bin/hf"))
+        self.assertEqual(run.call_args_list[0].args[0], [sys.executable, "-m", "venv", "--without-pip", str(tools)])
+        install = run.call_args_list[1].args[0]
+        self.assertEqual(install[:4], ["/usr/local/bin/uv", "--no-config", "pip", "install"])
+        self.assertEqual(install[install.index("--python") + 1], str(tools / "bin/python"))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_missing_uv_uses_host_pip_targeting_seedless_environment(self):
+        def which(command):
+            return None if command == "uv" else "/usr/bin/" + command
+        with mock.patch.object(app.shutil, "which", side_effect=which), \
+             mock.patch.object(app, "hf_cli_ready", side_effect=[False, True]), \
+             mock.patch.object(app, "run_cmd") as run:
+            app.install_tools(self.runtime)
+        self.assertEqual(run.call_args_list[1].args[0], [sys.executable, "-m", "pip", "--python",
+                         str(self.runtime / "hf-tools/bin/python"), "install", "--upgrade", "huggingface_hub>=1.20.1"])
+
+    def test_healthy_environment_is_reused_without_package_installs(self):
+        with mock.patch.object(app.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(app, "hf_cli_ready", return_value=True), \
+             mock.patch.object(app, "run_cmd") as run:
+            app.install_tools(self.runtime)
+        run.assert_not_called()
+
+    def test_broken_hf_entrypoint_is_not_treated_as_ready(self):
+        hf = self.runtime / "hf"
+        hf.write_text("broken", encoding="utf-8")
+        failed = subprocess.CompletedProcess([], 1, stdout="--format", stderr="ModuleNotFoundError")
+        with mock.patch.object(app.subprocess, "run", return_value=failed):
+            self.assertFalse(app.hf_cli_ready(hf))
+        with mock.patch.object(app.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertFalse(app.hf_cli_ready(hf))
+        old_cli = subprocess.CompletedProcess([], 0, stdout="old login help")
+        with mock.patch.object(app.subprocess, "run", return_value=old_cli):
+            self.assertFalse(app.hf_cli_ready(hf))
+
+    def test_failed_repair_reports_failure(self):
+        with mock.patch.object(app.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(app, "hf_cli_ready", return_value=False), \
+             mock.patch.object(app, "run_cmd"):
+            with self.assertRaisesRegex(RuntimeError, "HF CLI belum"):
+                app.install_tools(self.runtime)
+
+
 class DownloadTests(WorkspaceTest):
     def test_wget_keeps_partial_until_success_and_resumes_on_retry(self):
         worker = self.provisioner()

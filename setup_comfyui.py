@@ -89,6 +89,18 @@ def install_comfyui(comfy_dir, install_manager=True, update=False):
             run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=manager)
 
 
+def hf_cli_ready(hf):
+    """An executable left by a failed install is not necessarily a usable CLI."""
+    if not hf.is_file():
+        return False
+    try:
+        result = subprocess.run([str(hf), "auth", "login", "--help"],
+                                capture_output=True, text=True, timeout=30)
+        return result.returncode == 0 and "--format" in result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def install_tools(runtime):
     """Isolate the modern hf CLI so upgrading it cannot break ComfyUI packages."""
     for command in ("git", "wget", "nohup"):
@@ -96,13 +108,25 @@ def install_tools(runtime):
             raise RuntimeError(f"Perintah {command} belum tersedia. Instal dahulu (apt-get install {command}).")
     tools = runtime / "hf-tools"
     hf = tools / "bin" / "hf"
-    if not hf.exists():
-        run_cmd([sys.executable, "-m", "venv", str(tools)])
-        run_cmd([str(tools / "bin" / "python"), "-m", "pip", "install", "huggingface_hub>=1.20.1"])
+    if hf_cli_ready(hf):
+        return str(hf)
+
+    # Colab's system Python can have venv but a missing/broken ensurepip.
+    # Reuse partial environments without deleting any downloads or credentials.
+    log_info("Menyiapkan/memperbaiki HF tools tanpa ensurepip...")
+    run_cmd([sys.executable, "-m", "venv", "--without-pip", str(tools)])
+    tools_python = str(tools / "bin" / "python")
+    uv = shutil.which("uv")
+    if uv:
+        installer = [uv, "--no-config", "pip", "install", "--python", tools_python]
+    else:
+        # Host pip can manage a seedless venv (pip >= 22.3); pip is not needed
+        # inside hf-tools. --python keeps all HF dependencies out of ComfyUI.
+        installer = [sys.executable, "-m", "pip", "--python", tools_python, "install"]
+    run_cmd([*installer, "--upgrade", "huggingface_hub>=1.20.1"])
     # Device-code auth needs the new CLI output mode. No token prompt fallback.
-    help_result = subprocess.run([str(hf), "auth", "login", "--help"], capture_output=True, text=True, check=True)
-    if "--format" not in help_result.stdout:
-        raise RuntimeError(f"hf CLI terlalu lama. Hapus environment tools {tools} lalu jalankan setup lagi.")
+    if not hf_cli_ready(hf):
+        raise RuntimeError(f"HF CLI belum dapat dijalankan setelah instalasi di {tools}. Periksa output installer.")
     return str(hf)
 
 
