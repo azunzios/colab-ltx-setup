@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import platform
 import queue
@@ -30,6 +31,9 @@ MODEL_TYPES = (
     "checkpoints", "diffusion_models", "unet", "loras", "vae", "text_encoders",
     "clip", "clip_vision", "controlnet", "upscale_models", "embeddings", "style_models",
 )
+MODEL_EXTENSIONS = {".safetensors", ".sft", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".onnx",
+                    ".pkl", ".pickle", ".torchscript", ".weights", ".tflite", ".h5", ".hdf5", ".model", ".emb"}
+HF_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co"}
 TUNNEL_PATTERNS = {
     "cloudflare": r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
     "pinggy": r"https://[a-zA-Z0-9.-]+\.pinggy\.link",
@@ -303,6 +307,123 @@ def http_url(value):
     return value
 
 
+def hf_url_file(url):
+    parsed = urllib.parse.urlsplit(http_url(url))
+    if parsed.hostname not in HF_HOSTS:
+        raise ValueError("Gunakan URL file dari huggingface.co.")
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 5 or parts[2] not in ("blob", "resolve"):
+        raise ValueError("URL Hugging Face harus menuju satu file (blob/resolve), bukan repository atau folder tree/.")
+    repo = "/".join(parts[:2])
+    revision = urllib.parse.unquote(parts[3])
+    filename = urllib.parse.unquote("/".join(parts[4:]))
+    if parsed.path.endswith("/") or filename.endswith("/"):
+        raise ValueError("URL HF harus menunjuk file, bukan folder dengan akhiran /.")
+    return repo, filename, revision
+
+
+def normalize_download_url(url):
+    """HF preview pages are HTML; /resolve/ serves the actual file and redirects."""
+    url = http_url(url)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.hostname in HF_HOSTS:
+        repo, filename, revision = hf_url_file(url)
+        path = "/" + repo + "/resolve/" + urllib.parse.quote(revision, safe="") + "/" + urllib.parse.quote(filename, safe="/")
+        query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+        query["download"] = "true"
+        return urllib.parse.urlunsplit(("https", "huggingface.co", path, urllib.parse.urlencode(query), ""))
+    return url
+
+
+def parse_hf_source(source, filename="", revision="main"):
+    """Accept owner/repo + file, an hf:// file URI, or a blob/resolve URL."""
+    embedded = ""
+    if source.startswith(("https://", "http://")):
+        source, embedded, revision = hf_url_file(source)
+    elif source.startswith("hf://"):
+        parts = source[5:].split("/", 2)
+        if len(parts) < 2:
+            raise ValueError("URI HF harus hf://owner/repo/path/file.safetensors.")
+        name, separator, ref = parts[1].partition("@")
+        source = parts[0] + "/" + name
+        if separator:
+            revision = urllib.parse.unquote(ref)
+        embedded = urllib.parse.unquote(parts[2]) if len(parts) == 3 else ""
+    if embedded:
+        if filename and filename != embedded:
+            raise ValueError("Path file berbeda dengan file pada URL/URI HF. Kosongkan field path file.")
+        filename = embedded
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", source):
+        raise ValueError("Isi owner/repo, URL file Hugging Face, atau hf://owner/repo/path/file.")
+    validate_relative(filename, "File di repository")
+    if filename.startswith("-") or filename.endswith("/") or any(c in filename for c in "*?["):
+        raise ValueError("Pilih satu file yang persis, tanpa wildcard atau folder.")
+    if not revision or revision.startswith("-") or len(revision) > 200:
+        raise ValueError("Revision tidak valid.")
+    return source, filename, revision
+
+
+def model_filename(name):
+    path = validate_relative(name, "Nama file")
+    if len(path.parts) != 1 or path.suffix.lower() not in MODEL_EXTENSIONS:
+        raise ValueError("Pilih satu file model, misalnya .safetensors, .gguf, .ckpt, .pt, .pth, .bin, atau .onnx; bukan folder/HTML/TXT.")
+    return name
+
+
+def model_content_error(path):
+    """Inspect only a small prefix; never read multi-GB weights into RAM."""
+    if not path.is_file():
+        return "Hasil download bukan file biasa."
+    with path.open("rb") as handle:
+        prefix = handle.read(8192)
+    if not prefix:
+        return "File download kosong."
+    stripped = prefix.lstrip(b"\xef\xbb\xbf \r\n\t").lower()
+    if stripped.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"<?xml", b"<error")) or b"<html" in stripped[:1024]:
+        return "Hasil download adalah halaman HTML/XML, bukan model. Periksa URL dan akses repository."
+    if stripped.startswith(b"version https://git-lfs.github.com/spec/"):
+        return "Hasil download adalah pointer Git LFS, bukan bobot model."
+    # Safetensors starts with an 8-byte length followed by a potentially huge
+    # JSON header; PyTorch ZIP/pickle and GGUF also have readable metadata.
+    # Such binary prefixes must not be mistaken for a plain-text response.
+    utf16 = prefix.startswith((b"\xff\xfe", b"\xfe\xff"))
+    if not utf16 and (b"\x00" in prefix or prefix.startswith((b"PK\x03\x04", b"GGUF", b"\x80"))):
+        return ""
+    try:
+        text = prefix.decode("utf-16" if utf16 else "utf-8-sig", errors="replace")
+    except UnicodeError:
+        return ""
+    if text and sum(char.isprintable() or char in "\r\n\t" for char in text) / len(text) > 0.98:
+        return "Hasil download berupa teks/JSON, bukan file model biner. Untuk model gated/private, login dan gunakan metode Hugging Face."
+    return ""
+
+
+def validate_model_file(path, min_mib):
+    error = model_content_error(path)
+    if error:
+        raise ValueError(error)
+    size = path.stat().st_size
+    if size < min_mib * 1024**2:
+        raise ValueError(f"Ukuran file {size / 1024**2:.3f} MiB di bawah batas {min_mib:g} MiB. Jika model memang kecil, turunkan batas ukuran lalu kirim ulang.")
+    return size
+
+
+def find_hf_file(staging, filename):
+    """Select a file explicitly; never move a returned repository directory."""
+    expected = within(staging, filename)
+    if expected.is_file():
+        return expected
+    if expected.is_dir():
+        raise ValueError("HF mengembalikan folder. Pilih path satu file model, bukan folder.")
+    name = PurePosixPath(filename).name
+    # Also tolerate CLIs that flatten their output or add a repository prefix.
+    candidates = [path for path in staging.rglob("*") if path.name == name and path.is_file()
+                  and not any(part.startswith(".") for part in path.relative_to(staging).parts)]
+    if len(candidates) != 1:
+        raise ValueError(f"HF harus menghasilkan tepat satu file {name}; ditemukan {len(candidates)} kandidat.")
+    return within(staging, candidates[0].relative_to(staging).as_posix())
+
+
 class JobCancelled(Exception):
     pass
 
@@ -350,25 +471,23 @@ class Provisioner:
                 destination += "/" + subfolder
             within(self.comfy_dir, destination)
             payload.update(category=category, subfolder=subfolder, destination=destination)
+            try:
+                min_mib = float(data.get("min_mib", 1))
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Batas ukuran harus angka dalam MiB.") from exc
+            if not math.isfinite(min_mib) or not 0 <= min_mib <= 1024:
+                raise ValueError("Batas ukuran harus antara 0 dan 1024 MiB.")
+            payload["min_mib"] = min_mib
             if kind == "wget":
-                url = http_url(str(data.get("url", "")).strip())
+                url = normalize_download_url(str(data.get("url", "")).strip())
                 filename = str(data.get("filename", "")).strip() or urllib.parse.unquote(
                     PurePosixPath(urllib.parse.urlsplit(url).path).name)
-                path = validate_relative(filename, "Nama file")
-                if len(path.parts) != 1 or filename in (".", "..") or filename.endswith(".part"):
-                    raise ValueError("Isi nama file tunggal, tanpa direktori atau ekstensi .part.")
+                model_filename(filename)
                 payload.update(url=url, filename=filename)
             else:
-                repo = str(data.get("repo", "")).strip()
-                if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
-                    raise ValueError("Repo Hugging Face harus owner/nama-repo.")
-                filename = str(data.get("file", "")).strip()
-                validate_relative(filename, "File di repository")
-                if filename.startswith("-") or any(c in filename for c in "*?["):
-                    raise ValueError("Pilih satu file yang persis, tanpa wildcard.")
-                revision = str(data.get("revision", "main")).strip() or "main"
-                if revision.startswith("-") or len(revision) > 200:
-                    raise ValueError("Revision tidak valid.")
+                repo, filename, revision = parse_hf_source(str(data.get("repo", "")).strip(),
+                    str(data.get("file", "")).strip(), str(data.get("revision", "main")).strip() or "main")
+                model_filename(PurePosixPath(filename).name)
                 payload.update(repo=repo, file=filename, revision=revision)
         elif kind == "node":
             url = http_url(str(data.get("url", "")).strip())
@@ -476,23 +595,35 @@ class Provisioner:
                 raise ValueError(f"File sudah ada: {target}. Pilih subfolder/nama lain agar tidak tertimpa.")
             if kind == "wget":
                 partial = within(destination, name + ".part")
-                self.command(job, ["wget", "--continue", "--tries=5", "--timeout=30", "--progress=dot:giga",
+                if partial.exists() and model_content_error(partial):
+                    self.quarantine(job, partial)
+                self.command(job, ["wget", "--continue", "--max-redirect=20", "--tries=5", "--timeout=30", "--progress=dot:giga",
                                    "--output-document", str(partial), "--", p["url"]])
                 self.check_cancel(job)
-                partial.replace(target)
+                source = partial
             else:
                 # Keep staging on the same disk for atomic rename. Preserve repo subfolders
                 # here, then flatten the selected file into the chosen Comfy model category.
-                cache_key = hashlib.sha256(json.dumps(p, sort_keys=True).encode()).hexdigest()
+                cache_key = hashlib.sha256(json.dumps({key: p[key] for key in ("repo", "file", "revision")}, sort_keys=True).encode()).hexdigest()
                 staging = within(self.comfy_dir, f".provisioning/hf-downloads/{cache_key}")
                 staging.mkdir(parents=True, exist_ok=True)
                 self.command(job, [self.hf_command, "download", p["repo"], p["file"],
                                    "--revision", p["revision"], "--local-dir", str(staging)])
-                source = within(staging, p["file"])
-                if not source.is_file():
-                    raise RuntimeError("File tidak ditemukan setelah hf download.")
-                self.check_cancel(job)
-                source.replace(target)
+                source = find_hf_file(staging, p["file"])
+            self.check_cancel(job)
+            try:
+                size = validate_model_file(source, p.get("min_mib", 1))
+            except ValueError as exc:
+                rejected = self.quarantine(job, source)
+                raise ValueError(f"{exc} File dikarantina di {rejected}; tidak dimasukkan ke models/.") from exc
+            # Both download methods publish only the selected, validated file.
+            source.replace(target)
+            with self.lock:
+                job["result"] = {"path": str(target), "size": size}
+                self.persist(job)
+            with (self.jobs_dir / f"{job['id']}.log").open("a", encoding="utf-8") as output:
+                output.write(f"\nFile model tersimpan: {target}\nUkuran: {size} bytes\n")
+            if kind == "hf":
                 shutil.rmtree(staging)
         elif kind == "node":
             target = within(self.comfy_dir, f"custom_nodes/{p['name']}")
@@ -532,6 +663,14 @@ class Provisioner:
                                              headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(request, timeout=20) as response:
                 response.read()
+
+    def quarantine(self, job, source):
+        target = within(self.comfy_dir, f".provisioning/rejected/{job['id']}-{source.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            target = target.with_name(uuid.uuid4().hex + "-" + target.name)
+        source.replace(target)
+        return target
 
     def worker(self):
         while True:
@@ -704,51 +843,74 @@ DASHBOARD_HTML = r'''<!doctype html>
 <title>ComfyUI Provisioning</title><style>
 :root{color-scheme:dark;--bg:#10141d;--panel:#191f2c;--line:#30394d;--muted:#a4b1ca;--accent:#8bdbb1}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#eff3fc;font:15px/1.55 system-ui,sans-serif}
-main{max-width:1240px;margin:auto;padding:32px 22px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:24px}
+main{width:100%;margin:0;padding:22px 24px}header{display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:16px}
 h1{font-size:28px;letter-spacing:-.8px;margin:0}h2{font-size:18px;margin:0 0 15px}p{margin:8px 0 16px}.muted,small{color:var(--muted)}
-.badge{font-size:12px;letter-spacing:1.4px;color:var(--accent)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;min-width:0}
-.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0}.metric{padding:18px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:20px;margin-top:6px}
+header>div{min-width:0;max-width:100%}#rootPath,#destinationPreview{overflow-wrap:anywhere}.job>div{min-width:0}
+.badge{font-size:12px;letter-spacing:1.4px;color:var(--accent)}.grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:16px;align-items:start}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;min-width:0}
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) clamp(360px,30vw,560px);gap:16px;align-items:start}.panels{min-width:0}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}.tabs button{background:#252e41;color:#cad6ef}.tabs button[aria-pressed=true]{background:var(--accent);color:#11271d}.fields{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.queue{position:sticky;top:16px;max-height:calc(100vh - 32px);display:flex;flex-direction:column}.queue #jobs{max-height:230px;overflow:auto}.queue pre{min-height:180px;max-height:42vh;flex:1}.files-scroll{max-height:60vh;overflow:auto}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:14px 0}.metric{padding:12px 16px;border:1px solid var(--line);border-radius:12px}.metric strong{display:block;font-size:20px;margin-top:4px}
+.model-settings{grid-template-columns:1fr 1fr 1fr}.fields>div{min-width:0}.fields input,.fields select{min-width:0}
 label{display:block;color:#c6d1e7;font-size:13px;margin:12px 0 5px}input,select,button{font:inherit;border-radius:7px;padding:10px 12px;border:1px solid var(--line)}input,select{width:100%;background:#101622;color:#fff}input[type=checkbox]{width:auto}
 button,.button{cursor:pointer;background:var(--accent);color:#11271d;border:0;font-weight:650;text-decoration:none;display:inline-block;border-radius:7px;padding:10px 14px;font-size:14px}
 button.secondary,.button.secondary{background:#2c364c;color:#e6efff}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:16px}.row>*{flex:none}
 .full{grid-column:1/-1}.hidden,[hidden]{display:none!important}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;background:#0b1019;padding:16px;border-radius:9px;font:12px/1.6 ui-monospace,monospace}
-.job{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}.job .row{margin:0}.job small{display:block;overflow-wrap:anywhere}.completed{color:#8bdbb1}.failed,.cancelled,.interrupted{color:#ffb8a1}
+.job{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}.job .row{margin:0;flex-direction:column;align-items:stretch;gap:6px}.job small{display:block;overflow-wrap:anywhere}.completed{color:#8bdbb1}.failed,.cancelled,.interrupted{color:#ffb8a1}
 #notice{position:sticky;top:10px;background:#23344b;border:1px solid #617ca8;padding:12px 16px;border-radius:9px;margin-bottom:16px;z-index:2;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:9px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}td:last-child{white-space:nowrap}progress{width:100%;accent-color:var(--accent)}a{color:var(--accent)}
-@media(max-width:760px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.job{align-items:flex-start;flex-direction:column}main{padding:22px 14px}}
+@media(max-width:1180px){.panels>.grid{grid-template-columns:1fr}}@media(max-width:1000px){.workspace{grid-template-columns:1fr}.panels>.grid{grid-template-columns:1fr 1fr}.queue{position:static;max-height:none}.queue #jobs{max-height:250px}}
+@media(max-width:760px){.panels>.grid,.fields{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.job{grid-template-columns:1fr}.job .row{flex-direction:row}main{padding:18px 14px}}
 </style></head><body><main>
 <header><div><div class="badge">COLAB WORKSPACE / PROVISIONING</div><h1>ComfyUI control desk</h1><div id="rootPath" class="muted">Download, siapkan, lalu mulai berkarya.</div></div><div class="row"><a id="comfyLink" class="button hidden" target="_blank" rel="noopener">Buka ComfyUI ↗</a><button id="logout" class="secondary hidden">Kunci dashboard</button></div></header>
 <div id="notice" role="status" hidden></div>
 <section id="loginCard" class="card" style="max-width:520px"><h2>Masuk ke workspace</h2><p class="muted">Gunakan password dashboard yang tercetak di terminal setup atau perintah --status.</p><form id="loginForm"><label for="password">Password dashboard</label><input id="password" type="password" autocomplete="current-password" required><div class="row"><button>Masuk</button></div></form></section>
 <div id="app" class="hidden">
 <div class="metrics"><div class="metric"><small>DISK TERSEDIA</small><strong id="disk">—</strong><progress id="diskBar" max="100" value="0"></progress></div><div class="metric"><small>RAM TERPAKAI</small><strong id="ram">—</strong><small id="load">—</small></div><div class="metric"><small>GPU / VRAM / UTILISASI / SUHU</small><div id="gpu" style="margin-top:8px;white-space:pre-line">—</div></div></div>
-<div class="grid">
-<section class="card"><h2>01 / Download model & LoRA</h2><p class="muted">Pilih kategori tujuan di models/. Download berjalan di belakang layar.</p><form id="downloadForm">
+<nav class="tabs" aria-label="Fitur provisioning"><button data-tab="downloads" aria-pressed="true">Download & akun HF</button><button data-tab="dependencies" aria-pressed="false">Custom nodes & dependensi</button><button data-tab="resources" aria-pressed="false">Resource & file model</button></nav>
+<div class="workspace"><div class="panels"><div class="grid">
+<section class="card" data-panel="downloads"><h2>Download model & LoRA</h2><p class="muted">Pilih satu file dan kategori tujuan.</p><form id="downloadForm">
 <label for="method">Sumber</label><select id="method" name="kind"><option value="wget">URL langsung · wget (resume)</option><option value="hf">Hugging Face · satu file</option></select>
 <div id="wgetFields"><label for="url">URL file langsung</label><input id="url" name="url" type="url" placeholder="https://…/model.safetensors"><label for="filename">Nama file (opsional)</label><input id="filename" name="filename" placeholder="model.safetensors"></div>
-<div id="hfFields" class="hidden"><label for="repo">Repository</label><input id="repo" name="repo" placeholder="owner/nama-model"><label for="hfFile">Path file di repository</label><input id="hfFile" name="file" placeholder="split_files/loras/model.safetensors"><label for="revision">Revision</label><input id="revision" name="revision" value="main"><small>File disimpan langsung di kategori tujuan, tanpa folder repository. Model gated perlu persetujuan akses di Hugging Face.</small></div>
-<label for="category">Kategori tujuan</label><select id="category" name="category"></select><label for="subfolder">Subfolder (opsional)</label><input id="subfolder" name="subfolder" placeholder="ltx / project-saya"><div class="row"><button>Tambahkan ke antrean</button></div></form></section>
-<section class="card"><h2>02 / Hugging Face</h2><p class="muted">Login lewat browser dengan device code. Tidak perlu memasukkan token ke dashboard.</p><div class="row"><button data-kind="login">Login Hugging Face</button><button data-kind="whoami" class="secondary">Cek akun</button></div><p><small>Login memakai hf auth login. Setelah dimulai, buka URL Hugging Face dan salin kode dari log pekerjaan di bawah. Kode memiliki masa berlaku.</small></p><a href="https://huggingface.co/oauth/device" target="_blank" rel="noopener">Buka halaman device code ↗</a>
-<hr style="border:0;border-top:1px solid var(--line);margin:26px 0"><h2>Resource & layanan</h2><div id="services" class="muted">—</div><div class="row"><button data-kind="free" class="secondary">Unload model / bebaskan VRAM</button><button data-kind="pip_check" class="secondary">Cek konflik dependensi</button></div><p><small>Unload meminta ComfyUI melepas model; hasilnya bergantung pada pekerjaan yang sedang berjalan. Restart ComfyUI setelah memasang custom node atau dependensi baru.</small></p><div class="row"><button data-service="comfy" class="secondary">Log ComfyUI</button><button data-service="comfy_tunnel" class="secondary">Log tunnel ComfyUI</button><button data-service="dashboard_tunnel" class="secondary">Log tunnel dashboard</button></div></section>
-<section class="card"><h2>03 / Custom nodes</h2><form id="nodeForm"><input type="hidden" name="kind" value="node"><label for="nodeUrl">URL repository GitHub</label><input id="nodeUrl" name="url" type="url" placeholder="https://github.com/owner/custom-node" required><p><label><input type="checkbox" id="nodeRequirements" checked> Instal requirements.txt node setelah clone</label></p><small>Instal hanya repository yang Anda percayai. Node dan paket memakai environment Python ComfyUI.</small><div class="row"><button>Instal custom node</button></div></form></section>
-<section class="card"><h2>04 / Dependensi Python</h2><form id="requirementsForm"><input type="hidden" name="kind" value="requirements"><label for="reqPath">File requirements relatif terhadap ComfyUI</label><input id="reqPath" name="path" value="requirements.txt" required><div class="row"><button class="secondary">Instal requirements</button></div></form><form id="packagesForm"><input type="hidden" name="kind" value="packages"><label for="packages">Paket PyPI (pisahkan dengan spasi)</label><input id="packages" name="packages" placeholder="pillow safetensors" required><div class="row"><button class="secondary">Instal paket</button></div></form></section>
-<section class="card full"><h2>Antrean pekerjaan</h2><p class="muted">Dijalankan berurutan agar download dan instalasi tidak berebut resource. Aman menutup tab browser.</p><div id="jobs">Belum ada pekerjaan.</div><h2 style="margin-top:24px" id="logTitle">Log pekerjaan</h2><pre id="log" tabindex="0" aria-live="off">Pilih pekerjaan atau log layanan.</pre><div class="row"><button id="copyLog" class="secondary">Salin log / device code</button></div></section>
-<section class="card full"><h2>File model</h2><label for="inventoryCategory">Kategori</label><select id="inventoryCategory" style="max-width:300px"></select><div class="row"><button id="refreshFiles" class="secondary">Muat daftar file</button></div><p class="muted" id="fileCount"></p><table><thead><tr><th>Path</th><th>Ukuran</th></tr></thead><tbody id="files"></tbody></table></section>
-</div></div></main><script>
+<div id="hfFields" class="hidden"><label for="repo">Repository, URL file, atau hf:// URI</label><input id="repo" name="repo" placeholder="hf://owner/model/text_encoders/model.safetensors"><div class="fields"><div><label for="hfFile">Path file (untuk owner/repo)</label><input id="hfFile" name="file" placeholder="Kosongkan jika memakai URL/URI"></div><div><label for="revision">Revision (untuk owner/repo)</label><input id="revision" name="revision" value="main"></div></div><small>Folder repo tidak ikut disimpan.</small></div>
+<div class="fields model-settings"><div><label for="category">Kategori tujuan</label><select id="category" name="category"></select></div><div><label for="subfolder">Subfolder</label><input id="subfolder" name="subfolder" placeholder="Opsional"></div><div><label for="minMib">Minimum (MiB)</label><input id="minMib" name="min_mib" type="number" min="0" max="1024" step="any" value="1" required></div></div><small>Atur minimum 0 untuk model kecil. HTML, teks, JSON error, dan pointer LFS tetap ditolak.</small><div class="row"><button>Tambahkan ke antrean</button></div></form></section>
+<section class="card" data-panel="downloads"><h2>Akun Hugging Face</h2><p class="muted">Login lewat browser dengan device code. Tidak perlu memasukkan token ke dashboard.</p><div class="row"><button data-kind="login">Login Hugging Face</button><button data-kind="whoami" class="secondary">Cek akun</button></div><p><small>Buka URL Hugging Face dan salin kode dari log pekerjaan. Kode memiliki masa berlaku.</small></p><a href="https://huggingface.co/oauth/device" target="_blank" rel="noopener">Buka halaman device code ↗</a><hr style="border:0;border-top:1px solid var(--line);margin:22px 0"><h2>File masuk ke mana?</h2><p class="muted" id="destinationPreview">Pilih kategori tujuan.</p><p><small>URL halaman Hugging Face /blob/ otomatis diubah menjadi /resolve/ untuk mengambil file aslinya. Untuk model private/gated, gunakan metode Hugging Face dan pastikan akses model sudah disetujui.</small></p></section>
+<section class="card" data-panel="resources" hidden><h2>Resource & layanan</h2><div id="services" class="muted">—</div><div class="row"><button data-kind="free" class="secondary">Unload model / bebaskan VRAM</button><button data-kind="pip_check" class="secondary">Cek konflik dependensi</button></div><p><small>Unload meminta ComfyUI melepas model; hasilnya bergantung pada pekerjaan yang sedang berjalan. Restart ComfyUI setelah memasang custom node atau dependensi baru.</small></p><div class="row"><button data-service="comfy" class="secondary">Log ComfyUI</button><button data-service="comfy_tunnel" class="secondary">Log tunnel ComfyUI</button><button data-service="dashboard_tunnel" class="secondary">Log tunnel dashboard</button></div></section>
+<section class="card" data-panel="dependencies" hidden><h2>Custom nodes</h2><form id="nodeForm"><input type="hidden" name="kind" value="node"><label for="nodeUrl">URL repository GitHub</label><input id="nodeUrl" name="url" type="url" placeholder="https://github.com/owner/custom-node" required><p><label><input type="checkbox" id="nodeRequirements" checked> Instal requirements.txt node setelah clone</label></p><small>Instal hanya repository yang Anda percayai. Node dan paket memakai environment Python ComfyUI.</small><div class="row"><button>Instal custom node</button></div></form></section>
+<section class="card" data-panel="dependencies" hidden><h2>Dependensi Python</h2><form id="requirementsForm"><input type="hidden" name="kind" value="requirements"><label for="reqPath">File requirements relatif terhadap ComfyUI</label><input id="reqPath" name="path" value="requirements.txt" required><div class="row"><button class="secondary">Instal requirements</button></div></form><form id="packagesForm"><input type="hidden" name="kind" value="packages"><label for="packages">Paket PyPI (pisahkan dengan spasi)</label><input id="packages" name="packages" placeholder="pillow safetensors" required><div class="row"><button class="secondary">Instal paket</button></div></form></section>
+<section class="card" data-panel="resources" hidden><h2>File model</h2><label for="inventoryCategory">Kategori</label><select id="inventoryCategory"></select><div class="row"><button id="refreshFiles" class="secondary">Muat daftar file</button></div><p class="muted" id="fileCount"></p><div class="files-scroll"><table><thead><tr><th>Path</th><th>Ukuran</th></tr></thead><tbody id="files"></tbody></table></div></section>
+</div></div><aside class="card queue" aria-label="Antrean dan log"><h2>Antrean pekerjaan</h2><p class="muted">Berjalan berurutan. Aman menutup tab browser.</p><div id="jobs">Belum ada pekerjaan.</div><h2 style="margin-top:20px" id="logTitle">Log pekerjaan</h2><pre id="log" tabindex="0" aria-live="off">Pilih pekerjaan atau log layanan.</pre><div class="row"><button id="copyLog" class="secondary">Salin log / device code</button></div></aside></div></div></main><script>
 let credential=sessionStorage.getItem('comfy-provisioning-password')||'', selection=null, refreshing=false;
-const el=id=>document.getElementById(id), bytes=n=>n==null?'—':(n/1024**3).toFixed(2)+' GiB';
+const el=id=>document.getElementById(id), bytes=n=>{if(n==null)return '—';const units=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<units.length-1){n/=1024;i++;}return n.toFixed(i?2:0)+' '+units[i];};
 function notice(message){el('notice').textContent=message;el('notice').hidden=false;}
 async function api(path,data){const response=await fetch(path,{method:data?'POST':'GET',headers:{'Authorization':'Bearer '+credential,...(data?{'Content-Type':'application/json'}:{})},body:data?JSON.stringify(data):undefined});const result=await response.json();if(!response.ok){if(response.status===401)lock();throw Error(result.error||'Request gagal');}return result;}
 function lock(){credential='';sessionStorage.removeItem('comfy-provisioning-password');el('loginCard').classList.remove('hidden');el('app').classList.add('hidden');el('logout').classList.add('hidden');el('comfyLink').classList.add('hidden');selection=null;el('log').textContent='Pilih pekerjaan atau log layanan.';}
-async function connect(){const s=await api('/api/status');el('loginCard').classList.add('hidden');el('app').classList.remove('hidden');el('logout').classList.remove('hidden');el('notice').hidden=true;for(const id of ['category','inventoryCategory']){el(id).replaceChildren();for(const name of s.categories){const o=document.createElement('option');o.value=name;o.textContent=name;el(id).append(o);}}sessionStorage.setItem('comfy-provisioning-password',credential);renderStatus(s);await refresh();}
+async function connect(){const s=await api('/api/status');el('loginCard').classList.add('hidden');el('app').classList.remove('hidden');el('logout').classList.remove('hidden');el('notice').hidden=true;for(const id of ['category','inventoryCategory']){el(id).replaceChildren();for(const name of s.categories){const o=document.createElement('option');o.value=name;o.textContent=name;el(id).append(o);}}sessionStorage.setItem('comfy-provisioning-password',credential);renderStatus(s);updateDestination();await refresh();}
 function renderStatus(s){el('rootPath').textContent=s.comfy_dir;el('disk').textContent=bytes(s.disk.free)+' / '+bytes(s.disk.total);el('diskBar').value=100*s.disk.used/s.disk.total;el('ram').textContent=s.memory.MemTotal?bytes(s.memory.MemTotal-s.memory.MemAvailable)+' / '+bytes(s.memory.MemTotal):'Tidak tersedia';el('load').textContent='CPU load (1 / 5 / 15 m): '+s.load.map(n=>n.toFixed(2)).join(' / ');el('gpu').textContent=s.gpu;el('services').textContent=Object.entries(s.services).map(([n,r])=>n+': '+(r?'aktif':'berhenti')).join(' · ');if(/^https?:\/\//.test(s.comfy_url)){el('comfyLink').href=s.comfy_url;el('comfyLink').classList.remove('hidden');}}
 async function submit(data){try{const j=await api('/api/jobs',data);selection={job:j.id};el('logTitle').textContent='Log: '+j.kind;notice('Pekerjaan masuk antrean. Device code dan progres tersedia di log.');await refresh();}catch(e){notice(e.message);}}
 el('loginForm').onsubmit=async e=>{e.preventDefault();credential=el('password').value;try{await connect();el('password').value='';}catch(err){notice(err.message);}};el('logout').onclick=lock;
 el('method').onchange=()=>{const hf=el('method').value==='hf';el('hfFields').classList.toggle('hidden',!hf);el('wgetFields').classList.toggle('hidden',hf);};
+document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));document.querySelectorAll('[data-panel]').forEach(panel=>panel.hidden=panel.dataset.panel!==button.dataset.tab);});
+function updateDestination(){const root=el('rootPath').textContent,category=el('category').value,folder=el('subfolder').value.trim();el('destinationPreview').textContent=root+'/models/'+category+(folder?'/'+folder:'')+'/<nama-file-model>';}
+el('category').onchange=updateDestination;el('subfolder').oninput=updateDestination;
 for(const id of ['downloadForm','nodeForm','requirementsForm','packagesForm'])el(id).onsubmit=e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));if(id==='nodeForm')data.requirements=el('nodeRequirements').checked;submit(data);};
 document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=()=>submit({kind:b.dataset.kind}));
 document.querySelectorAll('[data-service]').forEach(b=>b.onclick=()=>{selection={service:b.dataset.service};el('logTitle').textContent='Log: '+b.dataset.service;refresh().catch(e=>notice(e.message));});
 async function jobAction(action,id){try{const result=await api('/api/'+action,{id});if(action==='retry')selection={job:result.id};await refresh();}catch(e){notice(e.message);}}
-function renderJobs(jobs){const container=el('jobs');container.replaceChildren();if(!jobs.length)container.textContent='Belum ada pekerjaan.';for(const j of jobs){const item=document.createElement('div');item.className='job';const info=document.createElement('div'),title=document.createElement('strong'),desc=document.createElement('small');title.className=j.status;title.textContent=j.kind+' · '+j.status;desc.textContent=j.error||j.payload.file||j.payload.filename||j.payload.name||new Date(j.created*1000).toLocaleString();info.append(title,desc);const actions=document.createElement('div');actions.className='row';const log=document.createElement('button');log.className='secondary';log.textContent='Lihat log';log.onclick=()=>{selection={job:j.id};el('logTitle').textContent='Log: '+j.kind;refresh().catch(e=>notice(e.message));};actions.append(log);if(['queued','running','failed','cancelled','interrupted'].includes(j.status)){const b=document.createElement('button');b.className='secondary';const action=['queued','running'].includes(j.status)?'cancel':'retry';b.textContent=action==='cancel'?'Batalkan':'Retry';b.onclick=()=>jobAction(action,j.id);actions.append(b);}item.append(info,actions);container.append(item);}}
+function renderJobs(jobs){
+ const container=el('jobs');container.replaceChildren();if(!jobs.length)container.textContent='Belum ada pekerjaan.';
+ for(const j of jobs){
+  const item=document.createElement('div');item.className='job';
+  const info=document.createElement('div'),title=document.createElement('strong'),desc=document.createElement('small');
+  title.className=j.status;title.textContent=j.kind+' · '+j.status;
+  desc.textContent=j.error||(j.result?j.result.path+' · '+bytes(j.result.size):'')||j.payload.file||j.payload.filename||j.payload.name||new Date(j.created*1000).toLocaleString();
+  info.append(title,desc);const actions=document.createElement('div');actions.className='row';
+  const log=document.createElement('button');log.className='secondary';log.textContent='Lihat log';
+  log.onclick=()=>{selection={job:j.id};el('logTitle').textContent='Log: '+j.kind;refresh().catch(e=>notice(e.message));};actions.append(log);
+  if(['queued','running','failed','cancelled','interrupted'].includes(j.status)){
+   const b=document.createElement('button');b.className='secondary';const action=['queued','running'].includes(j.status)?'cancel':'retry';
+   b.textContent=action==='cancel'?'Batalkan':'Retry';b.onclick=()=>jobAction(action,j.id);actions.append(b);
+  }
+  item.append(info,actions);container.append(item);
+ }
+}
 async function refresh(){if(!credential||refreshing)return;refreshing=true;try{const [s,jobs]=await Promise.all([api('/api/status'),api('/api/jobs')]);renderStatus(s);renderJobs(jobs);if(selection){const result=await api('/api/log?'+new URLSearchParams(selection));const log=el('log'),atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<40;log.textContent=result.text||'Menunggu pekerjaan dimulai…';if(atBottom)log.scrollTop=log.scrollHeight;}}finally{refreshing=false;}}
 el('copyLog').onclick=async()=>{try{await navigator.clipboard.writeText(el('log').textContent);notice('Log disalin.');}catch{notice('Pilih teks pada log, lalu salin secara manual.');}};
 el('refreshFiles').onclick=async()=>{try{const data=await api('/api/files?category='+encodeURIComponent(el('inventoryCategory').value));el('files').replaceChildren();for(const f of data.files){const tr=document.createElement('tr'),name=document.createElement('td'),size=document.createElement('td');name.textContent=f.path+(f.partial?' (belum selesai)':'');size.textContent=bytes(f.size);tr.append(name,size);el('files').append(tr);}el('fileCount').textContent=data.files.length+' file'+(data.truncated?' (dibatasi 2000)':'');}catch(e){notice(e.message);}};

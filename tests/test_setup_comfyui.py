@@ -100,13 +100,13 @@ class DownloadTests(WorkspaceTest):
             commands.append(command)
             partial = Path(command[command.index("--output-document") + 1])
             if len(commands) == 1:
-                partial.write_bytes(b"first")
+                partial.write_bytes(b"\x00first")
                 raise RuntimeError("connection lost")
-            self.assertEqual(partial.read_bytes(), b"first")
-            partial.write_bytes(b"first-second")
+            self.assertEqual(partial.read_bytes(), b"\x00first")
+            partial.write_bytes(b"\x00first-second")
         worker.command = transfer
         payload = {"kind": "wget", "url": "https://example.com/weights?x=1", "filename": "test.safetensors",
-                   "category": "loras", "subfolder": "project"}
+                   "category": "loras", "subfolder": "project", "min_mib": 0}
         first = worker.submit(payload)
         self.finish(worker)
         destination = self.comfy / "models/loras/project/test.safetensors"
@@ -116,7 +116,7 @@ class DownloadTests(WorkspaceTest):
         second = worker.submit(worker.jobs[first["id"]]["payload"])
         self.finish(worker)
         self.assertEqual(worker.jobs[second["id"]]["status"], "completed")
-        self.assertEqual(destination.read_bytes(), b"first-second")
+        self.assertEqual(destination.read_bytes(), b"\x00first-second")
         self.assertIn("--continue", commands[1])
         self.assertFalse(destination.with_suffix(".safetensors.part").exists())
         third = worker.submit(payload)
@@ -133,12 +133,12 @@ class DownloadTests(WorkspaceTest):
             source = staging / "nested/model.safetensors"
             if len(staging_paths) == 1:
                 source.parent.mkdir(parents=True)
-                source.write_bytes(b"partial")
+                source.write_bytes(b"\x00partial")
                 raise RuntimeError("cancelled transfer")
-            self.assertEqual(source.read_bytes(), b"partial")
-            source.write_bytes(b"complete")
+            self.assertEqual(source.read_bytes(), b"\x00partial")
+            source.write_bytes(b"\x00complete")
         worker.command = transfer
-        first = worker.submit({"kind": "hf", "repo": "owner/model", "file": "nested/model.safetensors", "category": "loras"})
+        first = worker.submit({"kind": "hf", "repo": "owner/model", "file": "nested/model.safetensors", "category": "loras", "min_mib": 0})
         self.finish(worker)
         self.assertEqual(worker.jobs[first["id"]]["status"], "failed")
         second = worker.submit(worker.jobs[first["id"]]["payload"])
@@ -146,7 +146,7 @@ class DownloadTests(WorkspaceTest):
         self.assertEqual(worker.jobs[second["id"]]["status"], "completed")
         self.assertEqual(staging_paths[0], staging_paths[1])
         self.assertFalse(staging_paths[1].exists())
-        self.assertEqual((self.comfy / "models/loras/model.safetensors").read_bytes(), b"complete")
+        self.assertEqual((self.comfy / "models/loras/model.safetensors").read_bytes(), b"\x00complete")
 
     def test_device_login_uses_cli_without_token_or_stdin_prompt(self):
         worker = self.provisioner()
@@ -219,6 +219,128 @@ class DownloadTests(WorkspaceTest):
         self.assertEqual(worker.jobs[job["id"]]["status"], "completed")
         self.assertEqual(command.call_count, 1)
         self.assertEqual(command.call_args.args[1][:4], [sys.executable, "-m", "pip", "install"])
+
+
+class ModelDownloadTests(WorkspaceTest):
+    def test_hf_preview_url_becomes_download_url_preserving_query_and_revision(self):
+        url = "https://huggingface.co/owner/model/blob/refs%2Fpr%2F1/text_encoders/a%20b.safetensors?download=false&x=1"
+        normalized = app.normalize_download_url(url)
+        self.assertEqual(normalized, "https://huggingface.co/owner/model/resolve/refs%2Fpr%2F1/text_encoders/a%20b.safetensors?download=true&x=1")
+        self.assertEqual(app.parse_hf_source(url), ("owner/model", "text_encoders/a b.safetensors", "refs/pr/1"))
+
+    def test_hf_uri_and_repo_path_choose_identical_file(self):
+        expected = ("owner/model", "text_encoders/a.safetensors", "main")
+        self.assertEqual(app.parse_hf_source("hf://owner/model/text_encoders/a.safetensors"), expected)
+        self.assertEqual(app.parse_hf_source("owner/model", "text_encoders/a.safetensors"), expected)
+        self.assertEqual(app.parse_hf_source("hf://owner/model@refs%2Fpr%2F1/text_encoders/a.safetensors")[2], "refs/pr/1")
+
+    def test_folder_and_non_model_files_are_rejected_before_download(self):
+        worker = self.provisioner()
+        for data in [
+            {"kind": "hf", "repo": "owner/model", "file": "text_encoders/"},
+            {"kind": "hf", "repo": "owner/model", "file": "text_encoders/model.safetensors/"},
+            {"kind": "hf", "repo": "hf://owner/model/"},
+            {"kind": "hf", "repo": "owner/model", "file": "README.txt"},
+            {"kind": "wget", "url": "https://huggingface.co/owner/model/tree/main/text_encoders"},
+            {"kind": "wget", "url": "https://huggingface.co/owner/model"},
+            {"kind": "wget", "url": "https://example.com/error.html"},
+        ]:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                worker.submit(data)
+        self.assertEqual(worker.snapshot(), [])
+
+    def test_text_html_json_and_lfs_rejected_even_with_zero_minimum(self):
+        file = self.runtime / "model.safetensors"
+        for content in [b"<!DOCTYPE html><html>login</html>" * 50000,
+                        b'{"error": "Access denied"}', b"401 Unauthorized\n",
+                        b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 123\n",
+                        "<html>login</html>".encode("utf-16"), b"\xef\xbb\xbf<html>error</html>"]:
+            with self.subTest(content=content[:40]):
+                file.write_bytes(content)
+                with self.assertRaises(ValueError):
+                    app.validate_model_file(file, 0)
+
+    def test_size_threshold_can_be_lowered_for_small_binary_embedding(self):
+        file = self.runtime / "embedding.pt"
+        file.write_bytes(b"\x00\x01\x02binary" * 128)
+        with self.assertRaisesRegex(ValueError, "di bawah batas"):
+            app.validate_model_file(file, 1)
+        self.assertEqual(app.validate_model_file(file, 0), file.stat().st_size)
+
+    def test_safetensors_large_json_header_and_binary_formats_are_not_text(self):
+        file = self.runtime / "model.safetensors"
+        header = json.dumps({"__metadata__": {"description": "a" * 16000},
+                             "weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}).encode()
+        for content in [len(header).to_bytes(8, "little") + header + b"\x00" * 4,
+                        b"GGUF\x03\x00\x00\x00" + b"metadata " * 2000,
+                        b"PK\x03\x04" + b"metadata " * 2000]:
+            with self.subTest(prefix=content[:8]):
+                file.write_bytes(content)
+                self.assertEqual(app.validate_model_file(file, 0), len(content))
+
+    def test_invalid_wget_output_is_quarantined_and_never_published(self):
+        worker = self.provisioner()
+        def download(job, command, **kwargs):
+            self.assertIn("--max-redirect=20", command)
+            Path(command[command.index("--output-document") + 1]).write_bytes(b"<html>login</html>")
+        worker.command = download
+        job = worker.submit({"kind": "wget", "url": "https://example.com/model.safetensors", "min_mib": 0})
+        self.finish(worker)
+        saved = worker.jobs[job["id"]]
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("HTML", saved["error"])
+        self.assertFalse((self.comfy / "models/checkpoints/model.safetensors").exists())
+        self.assertEqual(len(list((self.runtime / "rejected").iterdir())), 1)
+
+    def test_retry_does_not_resume_into_an_old_html_partial(self):
+        worker = self.provisioner()
+        partial = self.comfy / "models/checkpoints/model.safetensors.part"
+        partial.parent.mkdir(parents=True)
+        partial.write_bytes(b"<html>old error</html>")
+        def download(job, command, **kwargs):
+            self.assertFalse(partial.exists())
+            partial.write_bytes(b"\x00binary")
+        worker.command = download
+        job = worker.submit({"kind": "wget", "url": "https://example.com/model.safetensors", "min_mib": 0})
+        self.finish(worker)
+        self.assertEqual(worker.jobs[job["id"]]["status"], "completed")
+        self.assertEqual(len(list((self.runtime / "rejected").iterdir())), 1)
+
+    def test_hf_nested_and_flat_results_publish_same_single_filename(self):
+        worker = self.provisioner()
+        for index, relative in enumerate(("text_encoders/model.safetensors", "model.safetensors")):
+            def download(job, command, **kwargs):
+                staging = Path(command[command.index("--local-dir") + 1])
+                source = staging / relative
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(b"\x00binary")
+                (staging / "README.txt").write_text("metadata", encoding="utf-8")
+            worker.command = download
+            job = worker.submit({"kind": "hf", "repo": "hf://owner/model/text_encoders/model.safetensors",
+                                 "category": "text_encoders", "subfolder": str(index), "min_mib": 0})
+            self.finish(worker)
+            expected = self.comfy / f"models/text_encoders/{index}/model.safetensors"
+            self.assertEqual(worker.jobs[job["id"]]["status"], "completed")
+            self.assertEqual(worker.jobs[job["id"]]["result"]["path"], str(expected))
+            self.assertEqual(list(expected.parent.iterdir()), [expected])
+
+    def test_hf_directory_and_ambiguous_output_are_rejected(self):
+        staging = self.runtime / "staging"
+        (staging / "model.safetensors").mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "folder"):
+            app.find_hf_file(staging, "model.safetensors")
+        for prefix in ("a", "b"):
+            file = staging / prefix / "other.safetensors"
+            file.parent.mkdir()
+            file.write_bytes(b"\x00binary")
+        with self.assertRaisesRegex(ValueError, "2 kandidat"):
+            app.find_hf_file(staging, "nested/other.safetensors")
+
+    def test_size_threshold_rejects_nan_and_invalid_numbers(self):
+        worker = self.provisioner()
+        for value in ("nan", "inf", -1, "not-a-number", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                worker.submit({"kind": "wget", "url": "https://example.com/model.safetensors", "min_mib": value})
 
 
 class ValidationTests(WorkspaceTest):
